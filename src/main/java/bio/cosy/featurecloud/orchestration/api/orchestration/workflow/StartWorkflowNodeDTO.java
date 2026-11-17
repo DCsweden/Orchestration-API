@@ -33,6 +33,19 @@ public class StartWorkflowNodeDTO implements BaseName {
 
     private Boolean enableRemoteResultSaving = false;
 
+    // Flower SuperLink support: a volume the caller has already uploaded cert/key material into
+    // via the existing /volume endpoints (orch-api never generates or sees the key material
+    // itself). Mounted read-only; null means no cert volume is mounted, unchanged for every
+    // other tool.
+    private String certsVolumeName;
+
+    // Flower SuperLink support: publishes a single container port to the host so clinics'
+    // SuperNodes can reach it directly. The host port is chosen by the caller (not auto-assigned
+    // by Docker) so no response-shape change is needed to report it back. Both null means no
+    // port is published, unchanged for every other tool.
+    private Integer publishContainerPort;
+    private Integer publishHostPort;
+
     private List<String> environments = new ArrayList<>();
 
     public String getBasename() {

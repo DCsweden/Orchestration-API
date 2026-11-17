@@ -270,6 +270,24 @@ public class DockerAppService {
             String inputVolumeName,
             String outputVolumeName,
             boolean autokill) {
+        return startApplication(dto, inputVolumeName, outputVolumeName, autokill, null);
+    }
+
+    /**
+     * @param attachNetworkId when set, the container is created directly attached to this network
+     *                        instead of "none" - required for a published port
+     *                        (dto.getPublishContainerPort()) to actually work, since Docker fixes
+     *                        port forwarding to whatever network exists at container start and never
+     *                        rewires it on a later network change. See
+     *                        DockerNetworkService#createDedicatedNetworkForPublishedPort for how this
+     *                        network must be created (before this call) and why.
+     */
+    public CreateContainerResponse startApplication(
+            StartWorkflowNodeDTO dto,
+            String inputVolumeName,
+            String outputVolumeName,
+            boolean autokill,
+            String attachNetworkId) {
 
         Log.infof("Creating container for node %d in workflow %d",
                 dto.getWorkflowNodeId(), dto.getWorkflowId());
@@ -294,12 +312,24 @@ public class DockerAppService {
                     .withTarget(VOLUME_PATH.get(DockerVolumeType.OUTPUT)));
         }
 
+        if (StringUtils.isNotBlank(dto.getCertsVolumeName())) {
+            Log.infof("Mounting certs volume: %s to path %s",
+                    dto.getCertsVolumeName(), VOLUME_PATH.get(DockerVolumeType.CERTS));
+            mounts.add(new Mount()
+                    .withType(MountType.VOLUME)
+                    .withSource(dto.getCertsVolumeName())
+                    .withTarget(VOLUME_PATH.get(DockerVolumeType.CERTS))
+                    .withReadOnly(true));
+        }
+
         HostConfig hostConfig = HostConfig.newHostConfig()
                 .withMounts(mounts)
-                .withNetworkMode("none");
+                .withNetworkMode(attachNetworkId != null ? attachNetworkId : "none");
         // If we don't set networkMode to none docker auto attaches the
         // default bridge (with internet access etc)
-        // We add a custom dedicated network later anyways
+        // We add a custom dedicated network later anyways - unless attachNetworkId is set, in which
+        // case that network IS the dedicated one, created ahead of time so a published port survives
+        // container start (see DockerNetworkService#createDedicatedNetworkForPublishedPort)
 
         if (Boolean.TRUE.equals(dto.getNeedsHostAccess())) {
             hostConfig.withExtraHosts("host.docker.internal:host-gateway");
@@ -312,6 +342,25 @@ public class DockerAppService {
             containerConfig.enable().autokill().ifPresent(hostConfig::withAutoRemove);
         }
         containerConfig.enable().oomkillDisable().ifPresent(hostConfig::withOomKillDisable);
+
+        // Port publishing happens at the Docker host/netfilter level and applies regardless of
+        // which bridge network the container ends up attached to later (connectContainerToNetworks
+        // detaches it from "none" and attaches the dedicated network) - so this is independent of
+        // that internet-access restriction, not in conflict with it.
+        ExposedPort exposedPort = null;
+        if (dto.getPublishContainerPort() != null) {
+            exposedPort = ExposedPort.tcp(dto.getPublishContainerPort());
+            Ports portBindings = new Ports();
+            Ports.Binding binding = dto.getPublishHostPort() != null
+                    ? Ports.Binding.bindPort(dto.getPublishHostPort())
+                    : Ports.Binding.empty();
+            portBindings.bind(exposedPort, binding);
+            hostConfig.withPortBindings(portBindings);
+            Log.infof("Publishing container port %d%s", dto.getPublishContainerPort(),
+                    dto.getPublishHostPort() != null
+                            ? " to host port " + dto.getPublishHostPort()
+                            : " to a Docker-assigned host port");
+        }
 
         Map<String, String> labels = LabelsHelper.createLabelsForWorkflowNode(dto.getWorkflowId(), dto.getWorkflowNodeId());
         dto.getEnvironments().stream()
@@ -326,14 +375,17 @@ public class DockerAppService {
 
         try {
             Log.infof("Creating container with image: %s, name: %s", dto.getAppImage(), dto.getContainerName());
-            CreateContainerResponse container = dockerClient
+            var createCmd = dockerClient
                     .createContainerCmd(dto.getAppImage())
                     .withLabels(labels)
                     .withName(dto.getContainerName())
                     .withEnv(dto.getEnvironments())
                     // .withEntrypoint("tail", "-f", "/dev/null")
-                    .withHostConfig(hostConfig)
-                    .exec();
+                    .withHostConfig(hostConfig);
+            if (exposedPort != null) {
+                createCmd = createCmd.withExposedPorts(exposedPort);
+            }
+            CreateContainerResponse container = createCmd.exec();
             String containerId = container.getId();
             Log.infof("Starting container with ID: %s", containerId);
             dockerClient.startContainerCmd(containerId).exec();

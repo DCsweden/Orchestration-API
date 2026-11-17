@@ -42,7 +42,8 @@ public class DockerVolumeService {
     public static final Map<DockerVolumeType, String> VOLUME_PATH = Map.of(
             DockerVolumeType.INPUT, "/mnt/input",
             DockerVolumeType.OUTPUT, "/mnt/output",
-            DockerVolumeType.DATA, "/mnt/data"
+            DockerVolumeType.DATA, "/mnt/data",
+            DockerVolumeType.CERTS, "/mnt/certs"
     );
 
     @Inject

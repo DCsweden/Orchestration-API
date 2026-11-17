@@ -88,6 +88,18 @@ public class WorkflowNodeBO {
                 createDTO.getNeedsInternetAccess(),
                 createDTO.getNeedsHostAccess(),
                 createDTO.getNeedsFederatedLearningAccess());
+
+        if (createDTO.getPublishContainerPort() != null && access.internalOnly()) {
+            // Docker's "internal" network flag can never coexist with a published port.
+            // Rather than reject the request, a published port now implies unrestricted
+            // outbound access instead of leaving the port silently non-functional.
+            Log.warnf("Container %s requested a published port with no internet access; Docker "
+                            + "cannot combine the two, so granting unrestricted outbound access for "
+                            + "this container instead of leaving its published port non-functional",
+                    createDTO.getContainerName());
+            access = ContainerNetworkAccess.of(true, createDTO.getNeedsHostAccess(), createDTO.getNeedsFederatedLearningAccess());
+        }
+
         // Checked before anything is created so a misconfigured orchestrator does not leave a
         // started container behind that can never reach what it needs
         dockerNetworkService.ensureAccessIsConfigured(access);
@@ -113,9 +125,20 @@ public class WorkflowNodeBO {
             String outputVolumeName = ensureOutputVolume(createDTO);
             //First output, then input to ensure data consistency
             String inputVolumeName = ensureInputVolume(createDTO);
-            response = dockerAppService.startApplication(createDTO, inputVolumeName, outputVolumeName, false);
 
-            dockerNetworkService.connectContainerToNetworks(response.getId(), access);
+            if (createDTO.getPublishContainerPort() != null) {
+                // A published port only works if the container is created directly on its real
+                // network; the normal none -> connectContainerToNetworks dance never wires it up
+                // (see DockerNetworkService#createDedicatedNetworkForPublishedPort).
+                String dedicatedNetworkId = dockerNetworkService.createDedicatedNetworkForPublishedPort(
+                        createDTO.getContainerName(), access);
+                response = dockerAppService.startApplication(
+                        createDTO, inputVolumeName, outputVolumeName, false, dedicatedNetworkId);
+                dockerNetworkService.joinConfiguredNetworks(response.getId(), access.internalOnly());
+            } else {
+                response = dockerAppService.startApplication(createDTO, inputVolumeName, outputVolumeName, false);
+                dockerNetworkService.connectContainerToNetworks(response.getId(), access);
+            }
         } catch (Exception e) {
             Log.errorf(e, "Failed to start container for workflow %d node %d (image %s, name %s): %s",
                     createDTO.getWorkflowId(), createDTO.getWorkflowNodeId(),

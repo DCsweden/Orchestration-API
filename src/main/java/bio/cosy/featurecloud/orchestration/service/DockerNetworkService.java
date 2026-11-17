@@ -27,6 +27,12 @@ public class DockerNetworkService {
     // fl-<owner container id>-network-<uuid>, see createDedicatedNetworkAndConnect
     private static final Pattern DEDICATED_NETWORK = Pattern.compile("^fl-([0-9a-f]{64})-network-");
 
+    // fl-byname-<owner container name>-network-<uuid>, see createDedicatedNetworkForPublishedPort -
+    // used when the network must exist before the container does (its id isn't known yet), so it's
+    // keyed by the container's name instead.
+    private static final Pattern DEDICATED_NETWORK_BY_NAME =
+            Pattern.compile("^fl-byname-(.+)-network-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
+
     @Inject
     DockerClient dockerClient;
 
@@ -170,8 +176,18 @@ public class DockerNetworkService {
     public int removeOrphanedDedicatedNetworks() {
         int removed = 0;
         for (Network network : dockerClient.listNetworksCmd().exec()) {
-            Matcher matcher = DEDICATED_NETWORK.matcher(Objects.requireNonNullElse(network.getName(), ""));
-            if (matcher.find() && !containerExists(matcher.group(1)) && removeNetwork(network.getName())) {
+            String name = Objects.requireNonNullElse(network.getName(), "");
+            Matcher byId = DEDICATED_NETWORK.matcher(name);
+            Matcher byName = DEDICATED_NETWORK_BY_NAME.matcher(name);
+            boolean orphaned;
+            if (byId.find()) {
+                orphaned = !containerExists(byId.group(1));
+            } else if (byName.matches()) {
+                orphaned = !containerExistsByName(byName.group(1));
+            } else {
+                continue;
+            }
+            if (orphaned && removeNetwork(name)) {
                 removed++;
             }
         }
@@ -186,6 +202,14 @@ public class DockerNetworkService {
         } catch (NotFoundException ex) {
             return false;
         }
+    }
+
+    private boolean containerExistsByName(String containerName) {
+        return !dockerClient.listContainersCmd()
+                .withNameFilter(List.of(containerName))
+                .withShowAll(true)
+                .exec()
+                .isEmpty();
     }
 
     private boolean removeNetwork(String networkName) {
@@ -287,16 +311,26 @@ public class DockerNetworkService {
                     containerId);
         }
         removeUnwantedNetworks(containerId);
+        joinConfiguredNetworks(containerId, internalOnly);
 
+        // Create networks based on the given network participants configuration
+        createDedicatedNetworkAndConnect(containerId, access);
+    }
+
+    /**
+     * Joins a container onto every Docker network configured in 'container.network.names',
+     * respecting the internet-access restriction. Safe to call on an already-running container -
+     * this only ever adds networks, it never disconnects the one the container started with, which
+     * is what would break a published port (see createDedicatedNetworkForPublishedPort).
+     */
+    public void joinConfiguredNetworks(String containerId, boolean internalOnly) {
         List<Network> networks = findNetworksByConfiguredNames();
 
         if (networks.isEmpty()) {
             Log.debug("No networks found to connect container to based on configured network names, continuing with dedicated network creation");
         }
 
-        // Add networks based on the given networks configuration
         for (Network network : networks) {
-
             // Skip external networks when the container may not reach anything outside its bridge
             if (internalOnly && !Boolean.TRUE.equals(network.getInternal())) {
                 if (!containerConfig.network().alwaysBridge()) {
@@ -316,21 +350,11 @@ public class DockerNetworkService {
 
             connectContainerToNetwork(containerId, network.getId());
         }
-
-        // Create networks based on the given network participants configuration
-        createDedicatedNetworkAndConnect(containerId, access);
     }
 
 
     public void createDedicatedNetworkAndConnect(String containerId, ContainerNetworkAccess access) {
-        Set<String> participants = new LinkedHashSet<>();
-        // Only when the API is named for the dedicated network; otherwise the container reaches it
-        // over the configured networks and the dedicated one just isolates this container.
-        learningApi().ifPresent(participants::add);
-        if (access.federatedLearning()) {
-            participants.add(resolveController());
-            relay().ifPresent(participants::add);
-        }
+        Set<String> participants = resolveParticipants(access);
         boolean internalOnly = access.internalOnly();
         // Network names are capped at 128 chars, we cut to 125 chars
         // Note: Linux kernel has a limit of 15 chars for the network interface name,
@@ -342,21 +366,7 @@ public class DockerNetworkService {
         }
 
         Log.infof("Creating dedicated network '%s' (internalOnly=%s)", networkName, internalOnly);
-
-        CreateNetworkResponse created;
-        try {
-            created = dockerClient.createNetworkCmd()
-                    .withName(networkName)
-                    .withDriver("bridge")
-                    .withAttachable(true)
-                    .withInternal(internalOnly)
-                    .withCheckDuplicate(true)
-                    .exec();
-        } catch (Exception ex) {
-            Log.errorf(ex, "Failed to create dedicated network '%s'", networkName);
-            throw ex;
-        }
-
+        CreateNetworkResponse created = createNetwork(networkName, internalOnly);
         String networkId = created.getId();
         Log.infof("Created dedicated network '%s' with id %s", networkName, networkId);
         try {
@@ -367,6 +377,81 @@ public class DockerNetworkService {
         } catch (RuntimeException ex) {
             // Nothing tears the network down once the start failed, so do it here
             removeNetwork(networkId);
+            throw ex;
+        }
+    }
+
+    /**
+     * Creates a dedicated network for a container that is about to be started with a published
+     * port, and connects this experiment's other participants (learning API, controller, relay) to
+     * it - but NOT the container itself, since it doesn't exist yet.
+     * <p>
+     * This has to run before the container exists because Docker fixes a published port's host-side
+     * forwarding to whatever network the container had when it started; attaching it to a network
+     * afterward (the normal none -> createDedicatedNetworkAndConnect dance every other container
+     * goes through) never wires the forwarding up, and even migrating off a network that *did* work
+     * breaks it again. The container must be created directly on the network this method returns
+     * (see DockerAppService#startApplication's attachNetworkId parameter) and never disconnected
+     * from it afterward; joinConfiguredNetworks is safe to call afterward since it only ever adds
+     * networks, never removes the original one.
+     * <p>
+     * Named after the container's (already deterministic, pre-known) name rather than its id, since
+     * the id doesn't exist yet - see removeOrphanedDedicatedNetworks/DEDICATED_NETWORK_BY_NAME for
+     * the matching cleanup-on-startup lookup. Normal per-experiment cleanup needs no special
+     * handling: it finds this network by inspecting the container's actual attached networks, not by
+     * parsing the name.
+     *
+     * @param containerName the container's intended name (StartWorkflowNodeDTO#getContainerName())
+     * @param access         the network capabilities the container is about to be started with
+     * @return the created network's id, to pass into DockerAppService#startApplication
+     */
+    public String createDedicatedNetworkForPublishedPort(String containerName, ContainerNetworkAccess access) {
+        Set<String> participants = resolveParticipants(access);
+        boolean internalOnly = access.internalOnly();
+        String networkName = "fl-byname-" + containerName + "-network-" + UUID.randomUUID();
+        if (networkName.length() > 125) {
+            networkName = networkName.substring(0, 125);
+        }
+
+        Log.infof("Creating dedicated network '%s' for container '%s' before it exists, so its published port "
+                + "survives container start (internalOnly=%s)", networkName, containerName, internalOnly);
+        CreateNetworkResponse created = createNetwork(networkName, internalOnly);
+        String networkId = created.getId();
+        Log.infof("Created dedicated network '%s' with id %s", networkName, networkId);
+        try {
+            for (String participant : participants) {
+                connectContainerToNetwork(participant, networkId);
+            }
+        } catch (RuntimeException ex) {
+            removeNetwork(networkId);
+            throw ex;
+        }
+        return networkId;
+    }
+
+    private Set<String> resolveParticipants(ContainerNetworkAccess access) {
+        Set<String> participants = new LinkedHashSet<>();
+        // Only when the API is named for the dedicated network; otherwise the container reaches it
+        // over the configured networks and the dedicated one just isolates this container.
+        learningApi().ifPresent(participants::add);
+        if (access.federatedLearning()) {
+            participants.add(resolveController());
+            relay().ifPresent(participants::add);
+        }
+        return participants;
+    }
+
+    private CreateNetworkResponse createNetwork(String networkName, boolean internalOnly) {
+        try {
+            return dockerClient.createNetworkCmd()
+                    .withName(networkName)
+                    .withDriver("bridge")
+                    .withAttachable(true)
+                    .withInternal(internalOnly)
+                    .withCheckDuplicate(true)
+                    .exec();
+        } catch (Exception ex) {
+            Log.errorf(ex, "Failed to create dedicated network '%s'", networkName);
             throw ex;
         }
     }

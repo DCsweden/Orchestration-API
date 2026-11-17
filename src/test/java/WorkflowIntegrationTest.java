@@ -14,9 +14,17 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.net.ServerSocket;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -208,6 +216,198 @@ public class WorkflowIntegrationTest {
         }
     }
 
+
+    // Flower SuperLink support: a published port must actually be reachable from the host,
+    // independent of the dedicated-network/internet-access wiring applied afterwards.
+    @Test
+    public void publishedPortIsReachableFromHost() throws Exception {
+        int hostPort;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            hostPort = socket.getLocalPort();
+        }
+
+        long workflowId = 998L;
+        StartWorkflowNodeDTO step = getStartDTO(1L);
+        step.setWorkflowId(workflowId);
+        step.setIsFistNode(true);
+        step.setPublishContainerPort(80);
+        step.setPublishHostPort(hostPort);
+        // Docker never wires up a published port on an "internal" network (confirmed separately -
+        // this is a different, orthogonal limitation from the one this test targets), so this needs
+        // internet access on for now to isolate the create-before-reconnect timing fix.
+        step.setNeedsInternetAccess(true);
+
+        try {
+            given()
+                    .contentType(ContentType.JSON)
+                    .body(step)
+                    .when().post("/container/workflow")
+                    .then()
+                    .statusCode(200)
+                    .body("Id", notNullValue());
+
+            assertPortBecomesReachable(hostPort);
+        } finally {
+            given()
+                    .when().delete("/docker/workflow/{workflowId}/cleanup", workflowId)
+                    .then()
+                    .statusCode(anyOf(is(200), is(204)));
+        }
+    }
+
+    // Docker's "internal" network flag can never coexist with a published port, and there's no other
+    // egress-restriction mechanism in orch-api today, so a published port now implies
+    // unrestricted outbound access instead of the request simply failing or the port silently
+    // never working.
+    @Test
+    public void publishedPortWorksEvenWhenInternetAccessWasDeclined() throws Exception {
+        int hostPort;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            hostPort = socket.getLocalPort();
+        }
+
+        long workflowId = 996L;
+        StartWorkflowNodeDTO step = getStartDTO(1L);
+        step.setWorkflowId(workflowId);
+        step.setIsFistNode(true);
+        step.setPublishContainerPort(80);
+        step.setPublishHostPort(hostPort);
+        step.setNeedsInternetAccess(false);
+
+        try {
+            given()
+                    .contentType(ContentType.JSON)
+                    .body(step)
+                    .when().post("/container/workflow")
+                    .then()
+                    .statusCode(200)
+                    .body("Id", notNullValue());
+
+            assertPortBecomesReachable(hostPort);
+        } finally {
+            given()
+                    .when().delete("/docker/workflow/{workflowId}/cleanup", workflowId)
+                    .then()
+                    .statusCode(anyOf(is(200), is(204)));
+        }
+    }
+
+    private void assertPortBecomesReachable(int hostPort) throws Exception {
+        HttpClient client = HttpClient.newHttpClient();
+        HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + hostPort + "/"))
+                .timeout(Duration.ofSeconds(5))
+                .build();
+
+        HttpResponse<String> response = null;
+        Exception lastFailure = null;
+        for (int attempt = 0; attempt < 10 && response == null; attempt++) {
+            try {
+                response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            } catch (Exception e) {
+                lastFailure = e;
+                Thread.sleep(500);
+            }
+        }
+
+        Assertions.assertNotNull(response,
+                "Published port " + hostPort + " should become reachable from the host: " + lastFailure);
+        Assertions.assertEquals(200, response.statusCode(), "nginx should answer on the published host port");
+    }
+
+    // Flower SuperLink support: cert/key material staged into a named volume ahead of time
+    // (the existing /volume upload endpoints) must be readable, but not writable, from inside
+    // the container it's mounted into.
+    @Test
+    public void certsVolumeIsMountedReadOnlyInContainer() throws Exception {
+        String certsVolumeName = "test-certs-volume-" + System.currentTimeMillis();
+        given()
+                .contentType(ContentType.JSON)
+                .when().post("/volume/{name}", certsVolumeName)
+                .then()
+                .statusCode(201);
+
+        Path certFile = Files.createTempFile("ca", ".crt");
+        Files.writeString(certFile, "dummy-ca-cert-contents");
+
+        try {
+            given()
+                    .multiPart("file", certFile.toFile())
+                    .multiPart("fileName", "ca.crt")
+                    .contentType(MediaType.MULTIPART_FORM_DATA)
+                    .when().post("/volume/{name}/upload", certsVolumeName)
+                    .then()
+                    .statusCode(anyOf(is(200), is(204)));
+
+            long workflowId = 997L;
+            StartWorkflowNodeDTO step = getStartDTO(1L);
+            step.setWorkflowId(workflowId);
+            step.setIsFistNode(true);
+            step.setCertsVolumeName(certsVolumeName);
+
+            try {
+                CreateContainerResponse response = given()
+                        .contentType(ContentType.JSON)
+                        .body(step)
+                        .when().post("/container/workflow")
+                        .then()
+                        .statusCode(200)
+                        .body("Id", notNullValue())
+                        .extract().as(CreateContainerResponse.class);
+
+                String content = execAndCapture(response.getId(), "cat", "/mnt/certs/ca.crt");
+                Assertions.assertEquals("dummy-ca-cert-contents", content.trim(),
+                        "Certs volume content should be readable inside the container");
+
+                Long writeExitCode = execAndGetExitCode(response.getId(), "sh", "-c", "touch /mnt/certs/should-fail");
+                Assertions.assertNotEquals(0L, writeExitCode, "Certs volume should be mounted read-only");
+            } finally {
+                given()
+                        .when().delete("/docker/workflow/{workflowId}/cleanup", workflowId)
+                        .then()
+                        .statusCode(anyOf(is(200), is(204)));
+            }
+        } finally {
+            Files.deleteIfExists(certFile);
+            given()
+                    .when().delete("/volume/{name}", certsVolumeName)
+                    .then()
+                    .statusCode(anyOf(is(200), is(204), is(404)));
+        }
+    }
+
+    private String execAndCapture(String containerId, String... cmd) throws Exception {
+        var exec = dockerClient.execCreateCmd(containerId)
+                .withAttachStdout(true)
+                .withAttachStderr(true)
+                .withCmd(cmd)
+                .exec();
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        dockerClient.execStartCmd(exec.getId())
+                .exec(new ResultCallback.Adapter<Frame>() {
+                    @Override
+                    public void onNext(Frame frame) {
+                        try {
+                            out.write(frame.getPayload());
+                        } catch (IOException ignored) {
+                            // best-effort capture only
+                        }
+                    }
+                })
+                .awaitCompletion();
+        return out.toString(StandardCharsets.UTF_8);
+    }
+
+    private Long execAndGetExitCode(String containerId, String... cmd) throws Exception {
+        var exec = dockerClient.execCreateCmd(containerId)
+                .withAttachStdout(true)
+                .withAttachStderr(true)
+                .withCmd(cmd)
+                .exec();
+        dockerClient.execStartCmd(exec.getId())
+                .exec(new ResultCallback.Adapter<Frame>())
+                .awaitCompletion();
+        return dockerClient.inspectExecCmd(exec.getId()).exec().getExitCodeLong();
+    }
 
     private StartWorkflowNodeDTO getStartDTO(Long workflowNodeId) {
         StartWorkflowNodeDTO step = new StartWorkflowNodeDTO();
