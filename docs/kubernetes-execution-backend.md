@@ -88,8 +88,9 @@ Besides `orch.execution-backend=kubernetes`:
 | `orch.kubernetes.image-pull-secret` | If the tool registry needs credentials |
 | `orch.kubernetes.internal-cidrs` | See network isolation |
 
-The Docker event listener (pipeline cleanup) does not start under the
-Kubernetes backend.
+The Docker event listener (pipeline cleanup, exit codes) does not start under
+the Kubernetes backend, and neither does the startup cleanup of orphaned
+Docker networks.
 
 orch-api's ServiceAccount needs, in its namespace:
 
@@ -98,12 +99,16 @@ orch-api's ServiceAccount needs, in its namespace:
 | `jobs` (batch) | get, list, watch, create, patch, delete |
 | `pods` | get, list, watch, create, delete |
 | `pods/log` | get |
-| `pods/exec` | create |
+| `pods/exec` | get, create |
 | `services` | get, create |
 | `persistentvolumeclaims` | get, list, create, delete, deletecollection |
 | `networkpolicies` (networking.k8s.io) | create, delete |
 
-and, for `GET /docker/info` only, `list` on `nodes` (cluster-scoped). Where
+`get` on `pods/exec` as well as `create`: the client opens exec over a
+WebSocket, an HTTP GET upgrade, which the API server authorizes as `get`
+(with `create` alone, uploads into a volume fail with 403).
+
+And, for `GET /docker/info` only, `list` on `nodes` (cluster-scoped). Where
 the `OwnerReferencesPermissionEnforcement` admission plugin is on (e.g.
 OpenShift), also `update` on `jobs/finalizers`, because the Service and
 NetworkPolicy block their Job's deletion. The NetworkPolicies need a CNI that
@@ -118,6 +123,12 @@ enforces them.
 - `container.memory.swap`, `container.enable.oomkill-disable`: no Kubernetes
   equivalent.
 - `removeImage`: a no-op; nodes manage their own image cache.
+- **Exit codes** (`ContainerRunEntity.exitCode`, `GET run/container/{id}`):
+  recorded from Docker `die` events, which Kubernetes doesn't have. Runs keep
+  a null exit code until a Job watch reports it.
+- **System computing info** (`SystemComputingInfoBO`): reads the Docker
+  daemon and falls back to the orch-api container's own CPU/RAM, so on
+  Kubernetes it reports orch-api's Pod, not the nodes the runs land on.
 
 ## Tests
 
