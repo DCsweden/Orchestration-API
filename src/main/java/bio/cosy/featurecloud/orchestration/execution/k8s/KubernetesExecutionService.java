@@ -232,6 +232,9 @@ public class KubernetesExecutionService implements AppExecutionService {
                     .withLabels(K8sLabels.sanitize(labels))
                 .endMetadata()
                 .withNewSpec()
+                    // Created suspended, so no Pod runs before its Service and
+                    // NetworkPolicy exist; released below.
+                    .withSuspend(true)
                     .withBackoffLimit(0)
                     .withTtlSecondsAfterFinished(autokill ? 300 : null)
                     .withNewTemplate()
@@ -264,15 +267,29 @@ public class KubernetesExecutionService implements AppExecutionService {
         Job job = podSpecBuilder.build();
 
         Job created = client.batch().v1().jobs().inNamespace(namespace()).resource(job).create();
-        Log.infof("[k8s] Job %s created", created.getMetadata().getName());
+        String jobName = created.getMetadata().getName();
+        Log.infof("[k8s] Job %s created (suspended)", jobName);
 
-        createAppService(created);
-
-        if (networkIsolationEnabled) {
-            applyNetworkIsolation(created, labels, needsInternetAccess, needsFederatedLearningAccess);
+        // Fail closed: the Job stays suspended (no Pod) until its Service and
+        // NetworkPolicy exist. If either fails, the Job is deleted and the run
+        // never starts, instead of running without isolation. The two still
+        // name the Job as owner, so they are garbage-collected with it.
+        try {
+            createAppService(created);
+            if (networkIsolationEnabled) {
+                applyNetworkIsolation(created, labels, needsInternetAccess, needsFederatedLearningAccess);
+            }
+            client.batch().v1().jobs().inNamespace(namespace()).withName(jobName).edit(j -> new JobBuilder(j)
+                    .editSpec().withSuspend(false).endSpec()
+                    .build());
+            Log.infof("[k8s] Job %s released", jobName);
+        } catch (RuntimeException e) {
+            Log.errorf("[k8s] Could not isolate Job %s, deleting it instead of running it unisolated: %s", jobName, e.getMessage());
+            removeApplication(jobName);
+            throw e;
         }
 
-        return new AppRun(created.getMetadata().getName());
+        return new AppRun(jobName);
     }
 
     // Docker reaches a running app by its container name on a shared network.
@@ -304,6 +321,9 @@ public class KubernetesExecutionService implements AppExecutionService {
         client.services().inNamespace(namespace()).resource(service).create();
         Log.infof("[k8s] Service %s created for Job %s (port %d)", service.getMetadata().getName(), jobName, appPort);
     }
+
+    /** Link-local range holding the cloud instance metadata service (169.254.169.254). */
+    static final String LINK_LOCAL_CIDR = "169.254.0.0/16";
 
     // Set on every Pod by the Job controller (Kubernetes 1.27+).
     static final String JOB_NAME_LABEL = "batch.kubernetes.io/job-name";
@@ -378,19 +398,23 @@ public class KubernetesExecutionService implements AppExecutionService {
                 .build());
 
         if (needsInternetAccess) {
+            // The cloud instance metadata service (169.254.169.254 on AKS, GKE
+            // and EKS) is outside the pod, service and node ranges but hands
+            // out node credentials, so it is always excluded.
+            List<String> except = new ArrayList<>(List.of(LINK_LOCAL_CIDR));
             if (internalCidrs.isPresent() && !internalCidrs.get().isEmpty()) {
-                var ipBlock = new IPBlockBuilder()
-                        .withCidr("0.0.0.0/0")
-                        .withExcept(internalCidrs.get())
-                        .build();
-                egress.add(new NetworkPolicyEgressRuleBuilder()
-                        .addNewTo().withIpBlock(ipBlock).endTo()
-                        .build());
+                except.addAll(internalCidrs.get());
             } else {
-                Log.warnf("[k8s] Job %s needs internet access but orch.kubernetes.internal-cidrs isn't configured — allowing unrestricted egress for it instead of internet-only (it can still reach other pods/services; ingress into it is still limited to its peers).",
+                Log.warnf("[k8s] Job %s needs internet access but orch.kubernetes.internal-cidrs isn't configured — it may reach other pods/services as well as the internet (but not the cloud metadata service; ingress into it is still limited to its peers).",
                         job.getMetadata().getName());
-                egress.add(new NetworkPolicyEgressRuleBuilder().build());
             }
+            var ipBlock = new IPBlockBuilder()
+                    .withCidr("0.0.0.0/0")
+                    .withExcept(except)
+                    .build();
+            egress.add(new NetworkPolicyEgressRuleBuilder()
+                    .addNewTo().withIpBlock(ipBlock).endTo()
+                    .build());
         }
 
         NetworkPolicy policy = new NetworkPolicyBuilder()
@@ -513,13 +537,18 @@ public class KubernetesExecutionService implements AppExecutionService {
     private void ensurePvc(String dockerVolumeName) {
         String volumeName = K8sNames.pvcName(dockerVolumeName);
         var pvcs = client.persistentVolumeClaims().inNamespace(namespace());
-        if (pvcs.withName(volumeName).get() != null) {
+        PersistentVolumeClaim existing = pvcs.withName(volumeName).get();
+        if (existing != null) {
+            if (!K8sLabels.isOwned(existing.getMetadata().getLabels())) {
+                // Never mount someone else's volume (e.g. a database's) into a run.
+                throw new jakarta.ws.rs.ForbiddenException("Volume " + volumeName + " is not managed by this orch-api");
+            }
             return;
         }
         PersistentVolumeClaimBuilder builder = new PersistentVolumeClaimBuilder()
                 .withNewMetadata()
                     .withName(volumeName)
-                    .withLabels(LabelsHelper.createLabels())
+                    .withLabels(K8sLabels.owned())
                 .endMetadata()
                 .withNewSpec()
                     .withAccessModes("ReadWriteOnce")
@@ -578,11 +607,17 @@ public class KubernetesExecutionService implements AppExecutionService {
 
     @Override
     public AppInstance getById(String id) {
-        Job job = client.batch().v1().jobs().inNamespace(namespace()).withName(id).get();
+        Job job = ownedJob(id);
         if (job == null) {
             throw new NotFoundException("Container with ID " + id + " not found");
         }
         return toAppInstance(job);
+    }
+
+    /** The Job by name if it exists and this orch-api created it; null otherwise (not owned reads as not found). */
+    private Job ownedJob(String name) {
+        Job job = client.batch().v1().jobs().inNamespace(namespace()).withName(name).get();
+        return job != null && K8sLabels.isOwned(job.getMetadata().getLabels()) ? job : null;
     }
 
     @Override
@@ -608,7 +643,7 @@ public class KubernetesExecutionService implements AppExecutionService {
             return;
         }
         Map<String, String> labels = job.getMetadata().getLabels();
-        if (!isOwned(labels)) {
+        if (!K8sLabels.isOwned(labels)) {
             Log.warnf("[k8s] Refusing cleanup: Job %s expectedSystem=%s actualSystem=%s", id,
                     NamingService.getSystemName(), labels == null ? null : labels.get(DockerLabels.SYSTEM_NAME.toString()));
             return;
@@ -662,12 +697,6 @@ public class KubernetesExecutionService implements AppExecutionService {
         client.network().v1().networkPolicies().inNamespace(namespace()).withName(jobName).delete();
     }
 
-    private static boolean isOwned(Map<String, String> labels) {
-        // Label values are sanitized for Kubernetes, so compare the same way.
-        return labels != null && K8sLabels.sanitizeValue(NamingService.getSystemName())
-                .equals(labels.get(DockerLabels.SYSTEM_NAME.toString()));
-    }
-
     private static List<String> claimNames(Job job) {
         var volumes = job.getSpec().getTemplate().getSpec().getVolumes();
         return volumes == null ? List.of() : volumes.stream()
@@ -688,8 +717,7 @@ public class KubernetesExecutionService implements AppExecutionService {
 
     @Override
     public Optional<AppInstance> getByName(String name) {
-        Job job = client.batch().v1().jobs().inNamespace(namespace()).withName(name).get();
-        return Optional.ofNullable(job).map(this::toAppInstance);
+        return Optional.ofNullable(ownedJob(name)).map(this::toAppInstance);
     }
 
     private List<AppInstance> jobsByLabels(Map<String, String> labels) {
@@ -739,6 +767,10 @@ public class KubernetesExecutionService implements AppExecutionService {
     public Multi<String> getLogById(String id) {
         Log.infof("[k8s] Streaming logs for Job: %s", id);
         return Multi.createFrom().emitter(emitter -> {
+            if (ownedJob(id) == null) {
+                emitter.fail(new NotFoundException("Container with ID " + id + " not found"));
+                return;
+            }
             // Both waits below exist because attaching to logs on Kubernetes is
             // racy in a way it is not on Docker. `docker logs` blocks until the
             // container exists; the Kubernetes API answers immediately with

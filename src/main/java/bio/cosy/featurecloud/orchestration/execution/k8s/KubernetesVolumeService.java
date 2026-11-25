@@ -54,6 +54,10 @@ public class KubernetesVolumeService implements VolumeExecutionService {
     @ConfigProperty(name = "orch.kubernetes.image-pull-secret")
     Optional<String> imagePullSecret;
 
+    /** How long a copy between volumes may take (image pull and disk attach included). */
+    @ConfigProperty(name = "orch.kubernetes.transfer-timeout", defaultValue = "PT30M")
+    java.time.Duration transferTimeout;
+
     @ConfigProperty(name = "container.file-transfer.grant-users")
     Optional<List<String>> grantUsers;
 
@@ -68,7 +72,20 @@ public class KubernetesVolumeService implements VolumeExecutionService {
     public String ensureVolume(Long workflowId, DockerVolumeType type, String name) {
         String pvcName = K8sNames.pvcName(name);
         var pvcs = client.persistentVolumeClaims().inNamespace(namespace());
-        if (pvcs.withName(pvcName).get() != null) {
+        PersistentVolumeClaim existing = pvcs.withName(pvcName).get();
+        if (existing != null && existing.getMetadata().getDeletionTimestamp() != null) {
+            // A hard cleanup just deleted it (rerunning the same node): the
+            // pvc-protection finalizer keeps it until the old Pod is gone. Wait
+            // that out and create it fresh, instead of handing a Terminating
+            // claim to the new Job, whose Pod would then stay Pending.
+            Log.infof("[k8s] PVC %s is being deleted, waiting before recreating it", pvcName);
+            pvcs.withName(pvcName).waitUntilCondition(java.util.Objects::isNull, transferTimeout.toSeconds(), TimeUnit.SECONDS);
+            existing = null;
+        }
+        if (existing != null) {
+            if (!K8sLabels.isOwned(existing.getMetadata().getLabels())) {
+                throw new jakarta.ws.rs.ForbiddenException("Volume " + pvcName + " exists and is not managed by this orch-api");
+            }
             Log.infof("[k8s] PVC %s already exists", pvcName);
             return name;
         }
@@ -103,9 +120,10 @@ public class KubernetesVolumeService implements VolumeExecutionService {
     // ------------------------------------------------------------------
     // Copying between volumes — Kubernetes port of DockerVolumeService's
     // moveFileToToAnotherContainer: a short-lived Job with both PVCs
-    // mounted, running the same cp -a + chown/chmod shape. Mirrors that
-    // method's fidelity choice too: a failed copy is logged, not thrown —
-    // see docs/kubernetes-execution-backend.md.
+    // mounted, running the same cp -a + chown/chmod shape. Unlike Docker, a
+    // failed or timed-out copy throws: on Kubernetes an image pull plus a
+    // disk attach can take minutes, and the next node must not start on an
+    // empty input volume (WorkflowNodeBO turns the exception into a 400).
     // ------------------------------------------------------------------
 
     private static final String INPUT_MOUNT = "/mnt/input";
@@ -117,6 +135,8 @@ public class KubernetesVolumeService implements VolumeExecutionService {
             throw new BadRequestException("sourceVolumeName is empty");
         }
         Log.infof("[k8s] Copying %s/%s -> %s/%s", sourceVolumeName, sourceFileName, destVolumeName, destFileName);
+        requireOwned(K8sNames.pvcName(sourceVolumeName));
+        requireOwned(K8sNames.pvcName(destVolumeName));
 
         String inputPath = INPUT_MOUNT + "/" + sourceFileName;
         String outputPath = OUTPUT_MOUNT + "/" + destFileName;
@@ -127,7 +147,7 @@ public class KubernetesVolumeService implements VolumeExecutionService {
         var podSpecBuilder = new JobBuilder()
                 .withNewMetadata()
                     .withName(jobName)
-                    .withLabels(LabelsHelper.createLabels())
+                    .withLabels(K8sLabels.owned())
                 .endMetadata()
                 .withNewSpec()
                     .withBackoffLimit(0)
@@ -170,19 +190,33 @@ public class KubernetesVolumeService implements VolumeExecutionService {
                     .waitUntilCondition(j -> j != null && j.getStatus() != null
                                     && ((j.getStatus().getSucceeded() != null && j.getStatus().getSucceeded() > 0)
                                         || (j.getStatus().getFailed() != null && j.getStatus().getFailed() > 0)),
-                            120, TimeUnit.SECONDS);
+                            transferTimeout.toSeconds(), TimeUnit.SECONDS);
 
             boolean succeeded = finished != null && finished.getStatus() != null
                     && finished.getStatus().getSucceeded() != null && finished.getStatus().getSucceeded() > 0;
             if (!succeeded) {
-                Log.errorf("[k8s] Copy Job %s did not succeed — logs: %s", jobName, fetchLogsBestEffort(jobName));
-            } else {
-                Log.infof("[k8s] Copy Job %s succeeded", jobName);
+                String logs = fetchLogsBestEffort(jobName);
+                Log.errorf("[k8s] Copy Job %s did not succeed — logs: %s", jobName, logs);
+                throw new IllegalStateException("Copy from " + sourceVolumeName + " to " + destVolumeName + " failed");
             }
+            Log.infof("[k8s] Copy Job %s succeeded", jobName);
+        } catch (IllegalStateException e) {
+            throw e;
         } catch (Exception e) {
             Log.errorf("[k8s] Timed out or failed waiting for copy Job %s: %s", jobName, e.getMessage());
+            throw new IllegalStateException("Copy from " + sourceVolumeName + " to " + destVolumeName
+                    + " did not finish within " + transferTimeout, e);
         } finally {
             client.batch().v1().jobs().inNamespace(namespace()).withName(jobName).delete();
+        }
+    }
+
+    private void requireOwned(String pvcName) {
+        PersistentVolumeClaim pvc = client.persistentVolumeClaims().inNamespace(namespace()).withName(pvcName).get();
+        if (pvc == null || !K8sLabels.isOwned(pvc.getMetadata().getLabels())) {
+            // Not owned reads as not found: never copy into or out of a volume
+            // orch-api didn't create.
+            throw new jakarta.ws.rs.NotFoundException("Volume " + pvcName + " not found");
         }
     }
 

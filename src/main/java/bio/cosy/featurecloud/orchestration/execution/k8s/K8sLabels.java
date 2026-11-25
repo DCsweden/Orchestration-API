@@ -1,5 +1,9 @@
 package bio.cosy.featurecloud.orchestration.execution.k8s;
 
+import bio.cosy.featurecloud.orchestration.docker.DockerLabels;
+import bio.cosy.featurecloud.orchestration.docker.LabelsHelper;
+import bio.cosy.featurecloud.orchestration.helper.NamingService;
+
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.regex.Pattern;
@@ -17,6 +21,28 @@ final class K8sLabels {
     private static final Pattern UNSAFE_CHARS = Pattern.compile("[^A-Za-z0-9._-]");
 
     private K8sLabels() {
+    }
+
+    /**
+     * This deployment's ownership labels ({@code LabelsHelper.createLabels()}),
+     * Kubernetes-safe. Put on everything orch-api creates, and used as the
+     * selector for listing and bulk deletes.
+     */
+    static Map<String, String> owned() {
+        return sanitize(LabelsHelper.createLabels());
+    }
+
+    /**
+     * Whether an object carries this deployment's system name, the same test
+     * as {@code LabelsHelper.isOwned} on Docker. Every operation that takes a
+     * name from a caller checks this, so orch-api never reads, writes or
+     * deletes a Job, Pod or volume it didn't create, such as a database's PVC
+     * in the same namespace.
+     */
+    static boolean isOwned(Map<String, String> labels) {
+        // Label values are sanitized for Kubernetes, so compare the same way.
+        return labels != null && sanitizeValue(NamingService.getSystemName())
+                .equals(labels.get(DockerLabels.SYSTEM_NAME.toString()));
     }
 
     static Map<String, String> sanitize(Map<String, String> dockerLabels) {

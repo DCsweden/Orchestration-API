@@ -46,6 +46,7 @@ class KubernetesVolumeAdminServiceTest {
         service.volumeSize = "1Gi";
         service.storageClassName = Optional.empty();
         service.imagePullSecret = Optional.empty();
+        service.transferTimeout = java.time.Duration.ofSeconds(30);
     }
 
     @Test
@@ -72,6 +73,26 @@ class KubernetesVolumeAdminServiceTest {
 
         assertEquals(uid, client.persistentVolumeClaims().inNamespace(NS)
                 .withName(K8sNames.pvcName(VOLUME)).get().getMetadata().getUid());
+    }
+
+    @Test
+    void volumesOrchApiDidNotCreateCannotBeReadChangedOrDeleted() {
+        // e.g. the clinic's database volume in the same namespace
+        String foreign = "data-local-learning-db-0";
+        client.persistentVolumeClaims().inNamespace(NS).resource(new io.fabric8.kubernetes.api.model.PersistentVolumeClaimBuilder()
+                .withNewMetadata().withName(foreign).endMetadata().build()).create();
+        service.createVolume("mine");
+
+        org.junit.jupiter.api.Assertions.assertThrows(jakarta.ws.rs.NotFoundException.class, () -> service.getVolume(foreign));
+        org.junit.jupiter.api.Assertions.assertThrows(jakarta.ws.rs.NotFoundException.class, () -> service.downloadToLocalDir(foreign));
+        org.junit.jupiter.api.Assertions.assertThrows(jakarta.ws.rs.ForbiddenException.class, () -> service.createVolume(foreign));
+        org.junit.jupiter.api.Assertions.assertThrows(jakarta.ws.rs.ForbiddenException.class, () -> service.removeVolume(foreign));
+        org.junit.jupiter.api.Assertions.assertThrows(jakarta.ws.rs.NotFoundException.class,
+                () -> service.moveDataFromInputToOutput(foreign, "mine"));
+        service.removeAllVolumes();
+
+        assertNotNull(client.persistentVolumeClaims().inNamespace(NS).withName(foreign).get(), "the foreign volume is untouched");
+        assertEquals(0, service.listVolumes().size());
     }
 
     /**
