@@ -11,7 +11,8 @@ orch.execution-backend=kubernetes   # default: docker, unchanged
 ## How it fits in
 
 The callers no longer talk to the Docker services directly. They go through
-four backend-neutral interfaces in `execution/`:
+four backend-neutral interfaces in `execution/`, implemented in
+`execution/docker/` and `execution/k8s/`:
 
 | Interface | Docker implementation | Kubernetes implementation |
 |---|---|---|
@@ -38,7 +39,7 @@ so local-learning-api needs no change. `DockerWireContractTest` pins this.
 | Reaching the container by name on port 9000 | A ClusterIP Service `app-<job>` on `orch.kubernetes.app-port` (9000), owned by the Job. `Names[0]` is the Service name, so `BaseOrchestrator.getAppUrl` works as is |
 | Dedicated network per container | A NetworkPolicy per run, named like the Job and owned by it (see below) |
 | Named volume | PersistentVolumeClaim, `ReadWriteOnce`, `orch.kubernetes.volume-size`. Names are mapped with `K8sNames.pvcName` (`_` is not allowed in Kubernetes names) |
-| Copying a file between volumes (alpine container) | A short-lived alpine Job with both PVCs mounted, same `cp`/`chown` script and `container.file-transfer.*` settings |
+| Copying a file between volumes (alpine container) | A short-lived alpine Job with both PVCs mounted, same `cp`/`chown` script and `container.file-transfer.*` settings. Unlike Docker, a failed or timed-out copy fails the call, so the next node never starts on an empty input |
 | Volume upload/download for the REST API | A short-lived Pod with the PVC mounted, `exec` + tar through fabric8 (needs the OkHttp client, see `pom.xml`) |
 | Container logs | Pod log stream |
 | Labels | Same labels from `LabelsHelper`, values sanitized for Kubernetes (`K8sLabels`) |
@@ -53,7 +54,13 @@ Each run gets a NetworkPolicy that selects only its own Pod and allows:
 - for federated learning, the same for the controller (`container.network.controller`);
 - DNS;
 - with internet access: `0.0.0.0/0` except `orch.kubernetes.internal-cidrs`
-  (unset: unrestricted egress, with a warning).
+  and, always, `169.254.0.0/16`, so a tool can't reach the cloud instance
+  metadata service and its node credentials (internal CIDRs unset: other
+  pods may be reachable too, with a warning).
+
+The Job is created suspended and only released once its Service and
+NetworkPolicy exist. If either can't be created, the Job is deleted and the
+start fails, so a run never executes without its isolation.
 
 The peers come from the same `<host>:<port>` settings the Docker backend
 uses. `host` is a Service name, or `<service>.<namespace>[.svc…]` for
@@ -62,6 +69,16 @@ and the target port behind `port` for egress. A peer that doesn't resolve
 fails the start before anything is created
 (`ensureNetworkAccessConfigured`, as `DockerNetworkService.ensureAccessIsConfigured`
 does on Docker). Turn it off with `orch.kubernetes.network-isolation.enabled=false`.
+
+### Ownership
+
+Everything orch-api creates carries this deployment's labels
+(`LabelsHelper.createLabels()`, sanitized by `K8sLabels.owned()`), and every
+operation that takes a name from a caller checks them (`K8sLabels.isOwned`),
+as `LabelsHelper.isOwned` does on Docker. A Job or volume orch-api didn't
+create, such as a database's PVC in the same namespace, reads as not found;
+creating or removing one with that name is refused (403). Listing and bulk
+deletes select on the same labels.
 
 ### Cleanup
 
@@ -79,7 +96,7 @@ Besides `orch.execution-backend=kubernetes`:
 
 | Property | |
 |---|---|
-| `container.name` | Required in practice: a stable, DNS-safe name. It becomes part of run names and the ownership label; unset, `NamingService` makes up a new one on every start and earlier runs are no longer recognized as owned |
+| `container.name` | Required: a stable, lowercase DNS label of at most 40 characters (startup fails otherwise). It becomes part of run names and the ownership label; unset, `NamingService` makes up a new one on every start and earlier runs are no longer recognized as owned |
 | `container.network.learning` | `<service>:<port>` of the learning API, e.g. `local-learning-api:8080` |
 | `container.network.controller` | `<service>:<port>` of the controller's app-communication API, e.g. `controller:8001` |
 | `orch.docker.health-check=false` | There is no Docker daemon to check |
@@ -87,6 +104,7 @@ Besides `orch.execution-backend=kubernetes`:
 | `orch.kubernetes.storage-class`, `orch.kubernetes.volume-size` | PVCs |
 | `orch.kubernetes.image-pull-secret` | If the tool registry needs credentials |
 | `orch.kubernetes.internal-cidrs` | See network isolation |
+| `orch.kubernetes.transfer-timeout` | How long a file transfer or copy between volumes may take, image pull included. Default `PT30M` |
 
 The Docker event listener (pipeline cleanup, exit codes) does not start under
 the Kubernetes backend, and neither does the startup cleanup of orphaned
