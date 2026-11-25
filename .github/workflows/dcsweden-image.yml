@@ -37,9 +37,20 @@ jobs:
           java-version: "25"
           cache: maven
 
+      # mvnw downloads its wrapper jar and Maven on first use; that download
+      # sometimes fails on runners ("Could not find or load main class
+      # org.apache.maven.wrapper.MavenWrapperMain"). Fetch it with retries.
+      - name: Fetch the Maven wrapper
+        run: |
+          for i in 1 2 3; do
+            bash mvnw -q -ntp --version && exit 0
+            rm -f .mvn/wrapper/maven-wrapper.jar; rm -rf ~/.m2/wrapper; sleep 5
+          done
+          exit 1
+
       # Unit tests that need no Docker (the Testcontainers ones skip or need a daemon)
       - name: Build and test the Kubernetes backend
-        run: bash mvnw -B -ntp package -Dtest='K8sNamesTest,KubernetesExecutionServiceTest,DockerWireContractTest' -Dsurefire.failIfNoSpecifiedTests=false
+        run: bash mvnw -B -ntp package -Dtest='K8sNamesTest,KubernetesExecutionServiceTest,KubernetesVolumeAdminServiceTest,DockerWireContractTest' -Dsurefire.failIfNoSpecifiedTests=false
 
       - uses: docker/setup-buildx-action@v4
 
