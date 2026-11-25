@@ -18,6 +18,7 @@ import org.junit.jupiter.api.Test;
 import java.lang.reflect.Field;
 import java.lang.reflect.Proxy;
 import java.util.Map;
+import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -132,6 +133,81 @@ class KubernetesExecutionServiceTest {
 
         assertNotNull(client.batch().v1().jobs().inNamespace(NS).withName("run-3").get());
         assertNotNull(client.persistentVolumeClaims().inNamespace(NS).withName("run-3-volume-output").get());
+    }
+
+    @Test
+    void aRunStartsSuspendedAndIsReleasedOnlyOnceIsolated() {
+        prepareForStart(Optional.empty());
+        var run = service.startApplication(app(false));
+
+        Job job = client.batch().v1().jobs().inNamespace(NS).withName(run.id()).get();
+        assertNotNull(job);
+        assertFalse(job.getSpec().getSuspend(), "released after its Service and NetworkPolicy exist");
+        assertNotNull(client.network().v1().networkPolicies().inNamespace(NS).withName(run.id()).get());
+        assertNotNull(client.services().inNamespace(NS).withName(KubernetesExecutionService.serviceNameFor(run.id())).get());
+    }
+
+    @Test
+    void aRunThatCannotBeIsolatedIsDeletedNotStarted() {
+        prepareForStart(Optional.empty());
+        var first = service.startApplication(app(false));
+        // Leave its Service and NetworkPolicy behind (the mock server has no
+        // garbage collector), so isolating the second start fails with 409.
+        client.batch().v1().jobs().inNamespace(NS).withName(first.id()).delete();
+
+        assertThrows(RuntimeException.class, () -> service.startApplication(app(false)));
+        assertNull(client.batch().v1().jobs().inNamespace(NS).withName(first.id()).get(),
+                "a run that couldn't be isolated must not exist, let alone run");
+    }
+
+    @Test
+    void internetAccessNeverReachesTheCloudMetadataService() {
+        prepareForStart(Optional.of(List.of("10.0.0.0/8")));
+        var run = service.startApplication(app(true));
+        assertEquals(List.of("169.254.0.0/16", "10.0.0.0/8"), internetExcept(run.id()));
+
+        client.batch().v1().jobs().inNamespace(NS).withName(run.id()).delete();
+        client.network().v1().networkPolicies().inNamespace(NS).withName(run.id()).delete();
+        client.services().inNamespace(NS).withName(KubernetesExecutionService.serviceNameFor(run.id())).delete();
+
+        prepareForStart(Optional.empty());
+        var unconfigured = service.startApplication(app(true));
+        assertEquals(List.of("169.254.0.0/16"), internetExcept(unconfigured.id()));
+    }
+
+    @Test
+    void jobsOfAnotherDeploymentAreInvisible() {
+        createRun("foreign", "someone-else");
+        assertThrows(jakarta.ws.rs.NotFoundException.class, () -> service.getById("foreign"));
+        assertTrue(service.getByName("foreign").isEmpty());
+    }
+
+    private List<String> internetExcept(String policyName) {
+        var policy = client.network().v1().networkPolicies().inNamespace(NS).withName(policyName).get();
+        return policy.getSpec().getEgress().stream()
+                .flatMap(rule -> rule.getTo() == null ? java.util.stream.Stream.empty() : rule.getTo().stream())
+                .filter(peer -> peer.getIpBlock() != null)
+                .findFirst().orElseThrow().getIpBlock().getExcept();
+    }
+
+    private void prepareForStart(Optional<List<String>> internalCidrs) {
+        service.appPort = 9000;
+        service.volumeSize = "1Gi";
+        service.storageClassName = Optional.empty();
+        service.imagePullSecret = Optional.empty();
+        service.memoryLimitBytes = Optional.empty();
+        service.memoryRequestBytes = Optional.empty();
+        service.cpuRequest = Optional.empty();
+        service.internalCidrs = internalCidrs;
+    }
+
+    private static bio.cosy.featurecloud.orchestration.api.orchestration.container.StartAppDTO app(boolean internet) {
+        var dto = new bio.cosy.featurecloud.orchestration.api.orchestration.container.StartAppDTO();
+        dto.setIdentifier(7L);
+        dto.setGroupId(3L);
+        dto.setAppImage("tool:1");
+        dto.setNeedsInternetAccess(internet);
+        return dto;
     }
 
     private void createRun(String name, String system, String... claims) {

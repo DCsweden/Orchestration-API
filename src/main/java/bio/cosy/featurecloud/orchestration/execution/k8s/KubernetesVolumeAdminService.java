@@ -20,6 +20,7 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import jakarta.ws.rs.ForbiddenException;
 import jakarta.ws.rs.InternalServerErrorException;
 import jakarta.ws.rs.NotFoundException;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
@@ -88,8 +89,11 @@ public class KubernetesVolumeAdminService implements VolumeAdminService {
     @ConfigProperty(name = "orch.kubernetes.image-pull-secret")
     Optional<String> imagePullSecret;
 
+    /** How long a file transfer may take: waiting for its Pod, then the copy itself. */
+    @ConfigProperty(name = "orch.kubernetes.transfer-timeout", defaultValue = "PT30M")
+    java.time.Duration transferTimeout;
+
     private static final String MOUNT_PATH = "/data";
-    private static final String FEATURE_CLOUD_LABEL_KEY = LabelsHelper.createLabels().keySet().iterator().next();
 
     private String namespace() {
         return configuredNamespace.orElseGet(() -> client.getNamespace() != null ? client.getNamespace() : "default");
@@ -114,18 +118,32 @@ public class KubernetesVolumeAdminService implements VolumeAdminService {
     @Override
     public List<VolumeInfoDTO> listVolumes() {
         return client.persistentVolumeClaims().inNamespace(namespace())
-                .withLabel(FEATURE_CLOUD_LABEL_KEY)
+                .withLabels(K8sLabels.owned())
                 .list().getItems().stream().map(this::toDTO).toList();
     }
 
     @Override
     public VolumeInfoDTO getVolume(String volumeName) {
-        String name = K8sNames.pvcName(volumeName);
-        PersistentVolumeClaim pvc = client.persistentVolumeClaims().inNamespace(namespace()).withName(name).get();
+        return toDTO(requireOwned(K8sNames.pvcName(volumeName)));
+    }
+
+    /**
+     * The PVC if this orch-api created it. Every operation that takes a volume
+     * name goes through here (or {@link #ownedOrNull}), so a caller can never
+     * read, write or delete a volume orch-api doesn't own, such as a
+     * database's PVC in the same namespace. Not owned reads as not found.
+     */
+    private PersistentVolumeClaim requireOwned(String pvcName) {
+        PersistentVolumeClaim pvc = ownedOrNull(pvcName);
         if (pvc == null) {
-            throw new NotFoundException("Volume " + name + " not found");
+            throw new NotFoundException("Volume " + pvcName + " not found");
         }
-        return toDTO(pvc);
+        return pvc;
+    }
+
+    private PersistentVolumeClaim ownedOrNull(String pvcName) {
+        PersistentVolumeClaim pvc = client.persistentVolumeClaims().inNamespace(namespace()).withName(pvcName).get();
+        return pvc != null && K8sLabels.isOwned(pvc.getMetadata().getLabels()) ? pvc : null;
     }
 
     @Override
@@ -134,13 +152,16 @@ public class KubernetesVolumeAdminService implements VolumeAdminService {
         var pvcs = client.persistentVolumeClaims().inNamespace(namespace());
         PersistentVolumeClaim existing = pvcs.withName(name).get();
         if (existing != null) {
+            if (!K8sLabels.isOwned(existing.getMetadata().getLabels())) {
+                throw new ForbiddenException("Volume " + name + " exists and is not managed by this orch-api");
+            }
             return toDTO(existing);
         }
 
         PersistentVolumeClaimBuilder builder = new PersistentVolumeClaimBuilder()
                 .withNewMetadata()
                     .withName(name)
-                    .withLabels(K8sLabels.sanitize(LabelsHelper.createLabels()))
+                    .withLabels(K8sLabels.owned())
                 .endMetadata()
                 .withNewSpec()
                     .withAccessModes("ReadWriteOnce")
@@ -199,22 +220,22 @@ public class KubernetesVolumeAdminService implements VolumeAdminService {
      */
     private void withFileTransferPod(String dockerVolumeName, java.util.function.Consumer<String> action) {
         String volumeName = K8sNames.pvcName(dockerVolumeName);
-        if (client.persistentVolumeClaims().inNamespace(namespace()).withName(volumeName).get() == null) {
-            throw new NotFoundException("Volume " + volumeName + " not found");
-        }
+        requireOwned(volumeName);
 
         String podName = ("filetransfer-" + UUID.randomUUID()).substring(0, 30);
         PodBuilder podBuilder = new PodBuilder()
                 .withNewMetadata()
                     .withName(podName)
-                    .withLabels(LabelsHelper.createLabels())
+                    .withLabels(K8sLabels.owned())
                 .endMetadata()
                 .withNewSpec()
                     .withRestartPolicy("Never")
                     .addNewContainer()
                         .withName("filetransfer")
                         .withImage("alpine:latest")
-                        .withCommand("sleep", "300")
+                        // Outlives the transfer (deleted right after it): a large
+                        // upload over exec + tar must not be cut off by the Pod.
+                        .withCommand("sleep", String.valueOf(transferTimeout.toSeconds() + 60))
                         .addNewVolumeMount()
                             .withName("data")
                             .withMountPath(MOUNT_PATH)
@@ -238,7 +259,7 @@ public class KubernetesVolumeAdminService implements VolumeAdminService {
             client.pods().inNamespace(namespace()).withName(podName)
                     .waitUntilCondition(p -> p != null && p.getStatus() != null
                                     && "Running".equals(p.getStatus().getPhase()),
-                            60, TimeUnit.SECONDS);
+                            transferTimeout.toSeconds(), TimeUnit.SECONDS);
             action.accept(podName);
         } catch (Exception e) {
             throw new InternalServerErrorException("File transfer against volume " + volumeName + " failed: " + e.getMessage(), e);
@@ -249,11 +270,13 @@ public class KubernetesVolumeAdminService implements VolumeAdminService {
 
     @Override
     public void moveDataFromInputToOutput(String inputVolumeName, String outputVolumeName) {
+        requireOwned(K8sNames.pvcName(inputVolumeName));
+        requireOwned(K8sNames.pvcName(outputVolumeName));
         String jobName = ("cp-io-" + UUID.randomUUID()).substring(0, 20);
         JobBuilder jobBuilder = new JobBuilder()
                 .withNewMetadata()
                     .withName(jobName)
-                    .withLabels(LabelsHelper.createLabels())
+                    .withLabels(K8sLabels.owned())
                 .endMetadata()
                 .withNewSpec()
                     .withBackoffLimit(0)
@@ -308,7 +331,7 @@ public class KubernetesVolumeAdminService implements VolumeAdminService {
                     .waitUntilCondition(j -> j != null && j.getStatus() != null
                                     && ((j.getStatus().getSucceeded() != null && j.getStatus().getSucceeded() > 0)
                                         || (j.getStatus().getFailed() != null && j.getStatus().getFailed() > 0)),
-                            120, TimeUnit.SECONDS);
+                            transferTimeout.toSeconds(), TimeUnit.SECONDS);
             boolean succeeded = finished != null && finished.getStatus() != null
                     && finished.getStatus().getSucceeded() != null && finished.getStatus().getSucceeded() > 0;
             if (!succeeded) {
@@ -337,13 +360,21 @@ public class KubernetesVolumeAdminService implements VolumeAdminService {
 
     @Override
     public void removeVolume(String name) {
-        client.persistentVolumeClaims().inNamespace(namespace()).withName(K8sNames.pvcName(name)).delete();
+        String pvcName = K8sNames.pvcName(name);
+        PersistentVolumeClaim pvc = client.persistentVolumeClaims().inNamespace(namespace()).withName(pvcName).get();
+        if (pvc == null) {
+            return;
+        }
+        if (!K8sLabels.isOwned(pvc.getMetadata().getLabels())) {
+            throw new ForbiddenException("Volume " + pvcName + " is not managed by this orch-api");
+        }
+        client.persistentVolumeClaims().inNamespace(namespace()).withName(pvcName).delete();
     }
 
     @Override
     public void removeAllVolumes() {
         client.persistentVolumeClaims().inNamespace(namespace())
-                .withLabel(FEATURE_CLOUD_LABEL_KEY)
+                .withLabels(K8sLabels.owned())
                 .delete();
     }
 
