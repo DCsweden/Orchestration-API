@@ -25,7 +25,7 @@ public class DockerVolumeAdminAdapter implements VolumeAdminService {
     DockerVolumeService dockerVolumeService;
 
     private VolumeInfoDTO toDTO(InspectVolumeResponse v) {
-        return new VolumeInfoDTO(v.getName(), "docker", v.getDriver(), null, v.getLabels());
+        return VolumeInfoDTO.docker(v.getName(), v.getDriver(), v.getMountpoint(), v.getLabels(), v.getOptions());
     }
 
     @Override
@@ -41,7 +41,7 @@ public class DockerVolumeAdminAdapter implements VolumeAdminService {
     @Override
     public VolumeInfoDTO createVolume(String name) {
         var created = dockerVolumeService.createVolume(name);
-        return new VolumeInfoDTO(created.getName(), "docker", null, null, null);
+        return VolumeInfoDTO.docker(created.getName(), created.getDriver(), created.getMountpoint(), created.getLabels(), null);
     }
 
     @Override
@@ -59,6 +59,9 @@ public class DockerVolumeAdminAdapter implements VolumeAdminService {
             Path tmpDir = Files.createTempDirectory("vol-download-" + volumeName + "-");
             dockerVolumeService.moveDataToHost(volumeName, tmpDir.toAbsolutePath().toString());
             return tmpDir;
+        } catch (com.github.dockerjava.api.exception.NotFoundException e) {
+            // A missing volume stays a 404 (VolumeServiceImpl maps it), as before.
+            throw e;
         } catch (Exception e) {
             throw new InternalServerErrorException("Download failed: " + e.getMessage(), e);
         }
