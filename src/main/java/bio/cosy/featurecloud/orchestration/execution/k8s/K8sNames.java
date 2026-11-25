@@ -29,14 +29,33 @@ final class K8sNames {
         if (volumeName == null || volumeName.isBlank()) {
             return volumeName;
         }
-        String cleaned = UNSAFE_CHARS.matcher(volumeName.toLowerCase()).replaceAll("-")
-                .replaceAll("^[^a-z0-9]+", "")
-                .replaceAll("[^a-z0-9]+$", "");
+        String cleaned = trimNonAlphanumeric(UNSAFE_CHARS.matcher(volumeName.toLowerCase()).replaceAll("-"));
         if (cleaned.length() > MAX_LENGTH) {
             String hash = sha256(volumeName).substring(0, 10);
-            cleaned = cleaned.substring(0, MAX_LENGTH - hash.length() - 1).replaceAll("[^a-z0-9]+$", "") + "-" + hash;
+            cleaned = trimNonAlphanumeric(cleaned.substring(0, MAX_LENGTH - hash.length() - 1)) + "-" + hash;
         }
         return cleaned.isEmpty() ? "vol-" + sha256(volumeName).substring(0, 10) : cleaned;
+    }
+
+    /**
+     * Strips leading and trailing characters that aren't ASCII letters or
+     * digits. A loop rather than {@code replaceAll("[^a-z0-9]+$", "")}: that
+     * pattern takes quadratic time on long runs of such characters.
+     */
+    static String trimNonAlphanumeric(String value) {
+        int start = 0;
+        int end = value.length();
+        while (start < end && !isAsciiAlphanumeric(value.charAt(start))) {
+            start++;
+        }
+        while (end > start && !isAsciiAlphanumeric(value.charAt(end - 1))) {
+            end--;
+        }
+        return value.substring(start, end);
+    }
+
+    private static boolean isAsciiAlphanumeric(char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
     }
 
     private static String sha256(String value) {

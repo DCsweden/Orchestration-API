@@ -57,4 +57,17 @@ class K8sNamesTest {
         assertTrue(a.length() <= 253 && a.matches(RFC1123_SUBDOMAIN), a);
         assertNotEquals(a, b);
     }
+
+    @Test
+    void trimMatchesTheOldRegexAndStaysFastOnLongRuns() {
+        for (String in : new String[]{"", "-", "--a--", "a", "/a/b/", "..x..", "A-b_C", "9", "-9-", "a--b"}) {
+            String regex = in.replaceAll("^[^A-Za-z0-9]+", "").replaceAll("[^A-Za-z0-9]+$", "");
+            org.junit.jupiter.api.Assertions.assertEquals(regex, K8sNames.trimNonAlphanumeric(in), in);
+        }
+        String slashes = "/".repeat(200_000) + "a" + "/".repeat(200_000);
+        org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(java.time.Duration.ofSeconds(1),
+                () -> org.junit.jupiter.api.Assertions.assertEquals("a", K8sNames.trimNonAlphanumeric(slashes)));
+        org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(java.time.Duration.ofSeconds(2),
+                () -> K8sNames.pvcName("x" + "/".repeat(100_000) + "x"));
+    }
 }
