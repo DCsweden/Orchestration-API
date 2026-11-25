@@ -25,11 +25,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+
       - uses: github/codeql-action/init@v3
         with:
           languages: java-kotlin
-          # No build needed: CodeQL extracts Java from source.
-          build-mode: none
+          # A real build: build-mode none sees less of the code (it found
+          # nothing where the build-based default setup found 12 alerts).
+          build-mode: manual
+
+      - name: Build
+        run: bash mvnw -B -ntp compile -DskipTests
 
       - uses: github/codeql-action/analyze@v3
         with:
