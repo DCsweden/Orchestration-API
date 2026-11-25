@@ -57,6 +57,8 @@ import org.apache.commons.lang3.StringUtils;
 import java.time.Duration;
 import java.util.Objects;
 
+import io.quarkus.runtime.StartupEvent;
+import jakarta.enterprise.event.Observes;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
 import java.io.BufferedReader;
@@ -78,10 +80,11 @@ import java.util.Optional;
  * (a NetworkPolicy per Job) is implemented, not out of scope — see
  * {@link #applyNetworkIsolation}.
  *
- * <p>A Job's name is used as the {@code AppRun}/{@code AppInstance} id —
- * Job names already come out of {@code BaseName} DNS-label-safe
- * ({@code getContainerName()} lowercases and replaces underscores with
- * hyphens), so no separate id scheme is needed.
+ * <p>A Job's name is used as the {@code AppRun}/{@code AppInstance} id. It
+ * comes from {@code BaseName}, which builds it from {@code container.name}
+ * (the system name) and only replaces underscores; it doesn't lowercase. So
+ * {@link #validateSystemName} checks at startup that {@code container.name}
+ * is a lowercase DNS label, which makes every Job name valid.
  */
 @KubernetesBackend
 @ApplicationScoped
@@ -125,6 +128,28 @@ public class KubernetesExecutionService implements AppExecutionService {
 
     @ConfigProperty(name = "orch.kubernetes.internal-cidrs")
     Optional<List<String>> internalCidrs;
+
+    @ConfigProperty(name = "orch.execution-backend", defaultValue = "docker")
+    String executionBackend;
+
+    private static final java.util.regex.Pattern DNS_LABEL = java.util.regex.Pattern.compile("[a-z0-9]([-a-z0-9]*[a-z0-9])?");
+
+    /**
+     * Fails startup on the Kubernetes backend when {@code container.name} is
+     * not a lowercase DNS label: Job, Service and PVC names are built from
+     * it, and Kubernetes would reject them only at the first run.
+     */
+    void validateSystemName(@Observes StartupEvent event) {
+        if (!"kubernetes".equals(executionBackend)) {
+            return;
+        }
+        String name = NamingService.getSystemName();
+        if (name == null || name.length() > 40 || !DNS_LABEL.matcher(name).matches()) {
+            throw new IllegalStateException("container.name is '" + name + "': on the Kubernetes backend it must be a "
+                    + "lowercase DNS label of at most 40 characters (a-z, 0-9, '-'), because Job, Service and PVC "
+                    + "names are built from it.");
+        }
+    }
 
     // The port a running app serves on. local-learning-api's
     // BaseOrchestrator.getAppUrl hardcodes http://<Names[0]>:9000, so the
@@ -334,6 +359,27 @@ public class KubernetesExecutionService implements AppExecutionService {
      * (a hash prefix), so a fixed prefix is added; names that would overflow
      * are shortened and disambiguated with a hash of the full Job name.
      */
+    /**
+     * How local-learning-api reaches a run: the short Service name when it
+     * runs in the runs' namespace, {@code <service>.<namespace>} when
+     * container.network.learning names another namespace
+     * ({@code <service>.<namespace>:<port>}), where the short name wouldn't
+     * resolve.
+     */
+    String addressFor(String jobName) {
+        String service = serviceNameFor(jobName);
+        if (containerConfig == null) {
+            return service;
+        }
+        String learningNamespace = containerConfig.network().learning()
+                .map(address -> address.contains(":") ? address.substring(0, address.lastIndexOf(':')) : address)
+                .map(host -> host.split("\\."))
+                .filter(parts -> parts.length > 1)
+                .map(parts -> parts[1])
+                .orElse(namespace());
+        return learningNamespace.equals(namespace()) ? service : service + "." + namespace();
+    }
+
     public static String serviceNameFor(String jobName) {
         String candidate = "app-" + jobName;
         if (candidate.length() <= 63) {
@@ -756,7 +802,7 @@ public class KubernetesExecutionService implements AppExecutionService {
                         .filter(java.util.Objects::nonNull)
                         .toList();
         Map<String, String> labels = job.getMetadata().getLabels() == null ? Map.of() : new HashMap<>(job.getMetadata().getLabels());
-        return new AppInstance(name, name, image, labels, appStatus, volumeNames, serviceNameFor(name));
+        return new AppInstance(name, name, image, labels, appStatus, volumeNames, addressFor(name));
     }
 
     // ------------------------------------------------------------------
