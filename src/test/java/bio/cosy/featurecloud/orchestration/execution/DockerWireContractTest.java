@@ -105,4 +105,23 @@ class DockerWireContractTest {
         String b = KubernetesExecutionService.serviceNameFor("x".repeat(70) + "b");
         assertTrue(!a.equals(b), a + " vs " + b);
     }
+
+    @Test
+    void volumeResponsesKeepDockersFieldNames() throws Exception {
+        // The /volume API returned docker-java's InspectVolumeResponse before
+        // the backend split; its JSON must not change for Docker callers.
+        var inspect = mapper.readValue(
+                "{\"Name\":\"v1\",\"Driver\":\"local\",\"Mountpoint\":\"/var/lib/docker/volumes/v1/_data\","
+                        + "\"Labels\":{\"a\":\"b\"},\"Options\":{\"o\":\"p\"}}",
+                com.github.dockerjava.api.command.InspectVolumeResponse.class);
+        var dockerJson = mapper.readTree(mapper.writeValueAsString(inspect));
+        var dto = bio.cosy.featurecloud.orchestration.api.orchestration.volume.VolumeInfoDTO.docker(
+                inspect.getName(), inspect.getDriver(), inspect.getMountpoint(), inspect.getLabels(), inspect.getOptions());
+        var ourJson = mapper.readTree(mapper.writeValueAsString(dto));
+
+        for (String field : new String[]{"Name", "Driver", "Mountpoint", "Labels", "Options"}) {
+            org.junit.jupiter.api.Assertions.assertEquals(dockerJson.get(field), ourJson.get(field), field);
+        }
+        org.junit.jupiter.api.Assertions.assertNull(ourJson.get("name"), "no lowercase duplicate of Name");
+    }
 }
