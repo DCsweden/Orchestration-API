@@ -157,6 +157,11 @@ public class KubernetesVolumeAdminService implements VolumeAdminService {
 
     @Override
     public void uploadFile(String volumeName, Path localFile, String targetFileName) {
+        // An upload may come before the app that mounts the volume exists:
+        // local-learning-api stages a run's inputs, then starts it. Docker
+        // creates a named volume on first use, so create the PVC here the
+        // same way (no-op if it exists); the Job's ensurePvc reuses it.
+        createVolume(volumeName);
         withFileTransferPod(volumeName, podName -> {
             boolean ok = execClient.pods().inNamespace(namespace()).withName(podName)
                     .file(MOUNT_PATH + "/" + targetFileName)
