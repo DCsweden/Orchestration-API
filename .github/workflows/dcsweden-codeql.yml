@@ -1,0 +1,36 @@
+name: DCsweden CodeQL (Java)
+
+# DCsweden only, like dcsweden-image.yml: scans the code the clinic image is
+# built from, with the same default queries FedLearnNet runs on their PRs.
+# Lives on dcsweden/build only, so it stays out of the upstream pull
+# request. Findings show under the repository's Security tab.
+
+on:
+  push:
+    branches: ["dcsweden/build"]
+  workflow_dispatch:
+
+concurrency:
+  group: dcsweden-codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: java-kotlin
+          # No build needed: CodeQL extracts Java from source.
+          build-mode: none
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:java-kotlin
