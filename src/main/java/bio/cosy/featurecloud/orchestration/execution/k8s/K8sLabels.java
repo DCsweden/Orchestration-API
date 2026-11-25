@@ -34,7 +34,7 @@ final class K8sLabels {
             cleaned = cleaned.substring(0, 63);
         }
         // trim leading/trailing non-alphanumeric left over from truncation/replacement
-        cleaned = cleaned.replaceAll("^[^A-Za-z0-9]+", "").replaceAll("[^A-Za-z0-9]+$", "");
+        cleaned = K8sNames.trimNonAlphanumeric(cleaned);
         return cleaned.isEmpty() ? "unset" : cleaned;
     }
 }
