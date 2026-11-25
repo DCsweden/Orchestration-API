@@ -182,6 +182,28 @@ class KubernetesExecutionServiceTest {
         assertTrue(service.getByName("foreign").isEmpty());
     }
 
+    @Test
+    void theAddressIsQualifiedOnlyWhenLearningApiIsInAnotherNamespace() {
+        String job = "run-9";
+        assertEquals(KubernetesExecutionService.serviceNameFor(job), service.addressFor(job));
+
+        service.containerConfig = containerConfig("local-learning-api.shared:8080", "controller:8001");
+        assertEquals(KubernetesExecutionService.serviceNameFor(job) + "." + NS, service.addressFor(job));
+    }
+
+    @Test
+    void containerNameMustBeALowercaseDnsLabelOnKubernetes() throws Exception {
+        service.executionBackend = "kubernetes";
+        service.validateSystemName(null);
+
+        setSystemName("Clinic_1");
+        assertThrows(IllegalStateException.class, () -> service.validateSystemName(null));
+
+        service.executionBackend = "docker";
+        service.validateSystemName(null);
+        setSystemName(SYSTEM);
+    }
+
     private List<String> internetExcept(String policyName) {
         var policy = client.network().v1().networkPolicies().inNamespace(NS).withName(policyName).get();
         return policy.getSpec().getEgress().stream()
