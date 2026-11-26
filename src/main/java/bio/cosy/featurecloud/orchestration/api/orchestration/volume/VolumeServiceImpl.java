@@ -6,6 +6,7 @@ import com.github.dockerjava.api.exception.NotFoundException;
 import io.quarkus.logging.Log;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.StreamingOutput;
 import org.jboss.resteasy.reactive.multipart.FileUpload;
@@ -71,13 +72,16 @@ public class VolumeServiceImpl implements VolumeService {
             );
             return Response
                     .ok()
+                    .type(MediaType.TEXT_PLAIN_TYPE)
                     .entity("File successfully uploaded into volume '" + name + "'.")
                     .build();
 
         } catch (Exception e) {
+            Log.errorf(e, "Upload failed: volume=%s", name);
             return Response
                     .status(Response.Status.BAD_REQUEST)
-                    .entity("Upload failed: " + e.getMessage())
+                    .type(MediaType.TEXT_PLAIN_TYPE)
+                    .entity("Upload failed; see the orch-api log for details.")
                     .build();
         }
     }
@@ -96,13 +100,16 @@ public class VolumeServiceImpl implements VolumeService {
             );
             return Response
                     .ok()
+                    .type(MediaType.TEXT_PLAIN_TYPE)
                     .entity("File successfully uploaded into volume '" + name + "'.")
                     .build();
 
         } catch (Exception e) {
+            Log.errorf(e, "Upload failed: volume=%s", name);
             return Response
                     .status(Response.Status.BAD_REQUEST)
-                    .entity("Upload failed: " + e.getMessage())
+                    .type(MediaType.TEXT_PLAIN_TYPE)
+                    .entity("Upload failed; see the orch-api log for details.")
                     .build();
         }
     }
@@ -141,12 +148,14 @@ public class VolumeServiceImpl implements VolumeService {
         } catch (NotFoundException | jakarta.ws.rs.NotFoundException e) {
             Log.warnf("Volume download refused: volume=%s does not exist", name);
             return Response.status(Response.Status.NOT_FOUND)
+                    .type(MediaType.TEXT_PLAIN_TYPE)
                     .entity("Output volume does not exist: " + name).build();
         } catch (Exception e) {
             Log.errorf(e, "Volume download failed: volume=%s", name);
             return Response
                     .status(Response.Status.INTERNAL_SERVER_ERROR)
-                    .entity("Download failed: " + e.getMessage())
+                    .type(MediaType.TEXT_PLAIN_TYPE)
+                    .entity("Download failed; see the orch-api log for details.")
                     .build();
         }
     }

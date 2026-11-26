@@ -7,6 +7,7 @@ import com.github.dockerjava.api.exception.NotModifiedException;
 import io.quarkus.logging.Log;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 
 import static jakarta.ws.rs.core.Response.Status.INTERNAL_SERVER_ERROR;
@@ -57,8 +58,10 @@ public class DockerServiceImpl implements DockerService {
         } catch (NotModifiedException e) {
             return Response.ok().build();
         } catch (Exception e) {
-            Log.errorf(e, "Error cleaning up workflow %d: %s", workflowId, e.getMessage());
-            return Response.status(INTERNAL_SERVER_ERROR).entity(e.getMessage()).build();
+            Log.errorf(e, "Error cleaning up workflow %d", workflowId);
+            return Response.status(INTERNAL_SERVER_ERROR)
+                    .type(MediaType.TEXT_PLAIN_TYPE)
+                    .entity("Cleanup failed; see the orch-api log for details.").build();
         }
     }
 
@@ -70,7 +73,10 @@ public class DockerServiceImpl implements DockerService {
         } catch (NotModifiedException e) {
             return Response.ok().build();
         } catch (Exception e) {
-            return Response.status(INTERNAL_SERVER_ERROR).entity(e.getMessage()).build();
+            Log.errorf(e, "Error cleaning up workflow node %d", workflowNodeId);
+            return Response.status(INTERNAL_SERVER_ERROR)
+                    .type(MediaType.TEXT_PLAIN_TYPE)
+                    .entity("Cleanup failed; see the orch-api log for details.").build();
         }
     }
 }

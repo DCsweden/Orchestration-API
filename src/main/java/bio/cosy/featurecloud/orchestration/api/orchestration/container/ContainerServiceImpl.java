@@ -8,6 +8,7 @@ import bio.cosy.featurecloud.orchestration.execution.AppInstance;
 import bio.cosy.featurecloud.orchestration.execution.AppRun;
 import bio.cosy.featurecloud.orchestration.helper.ContainerNetworkEnv;
 import com.github.dockerjava.api.command.CreateContainerResponse;
+import io.quarkus.logging.Log;
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
 import io.smallrye.mutiny.infrastructure.Infrastructure;
@@ -16,6 +17,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.transaction.Transactional;
 import jakarta.ws.rs.NotFoundException;
+import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.eclipse.microprofile.reactive.messaging.Channel;
 
@@ -151,7 +153,10 @@ public class ContainerServiceImpl implements ContainerService {
         } catch (NotFoundException e) {
             return Response.ok().build();
         } catch (Exception e) {
-            return Response.status(Response.Status.BAD_REQUEST).entity(e.getMessage()).build();
+            Log.errorf(e, "Cleanup failed: container=%s", containerId);
+            return Response.status(Response.Status.BAD_REQUEST)
+                    .type(MediaType.TEXT_PLAIN_TYPE)
+                    .entity("Cleanup failed; see the orch-api log for details.").build();
         }
     }
 
@@ -166,7 +171,10 @@ public class ContainerServiceImpl implements ContainerService {
             appBO.stopContainers(containerIds, cleanup);
             return Response.ok().build();
         } catch (Exception e) {
-            return Response.status(Response.Status.BAD_REQUEST).entity(e.getMessage()).build();
+            Log.errorf(e, "Cleanup failed: containers=%s", containerIds);
+            return Response.status(Response.Status.BAD_REQUEST)
+                    .type(MediaType.TEXT_PLAIN_TYPE)
+                    .entity("Cleanup failed; see the orch-api log for details.").build();
         }
     }
 }
