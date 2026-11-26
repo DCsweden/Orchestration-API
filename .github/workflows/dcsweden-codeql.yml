@@ -4,6 +4,13 @@ name: DCsweden CodeQL (Java)
 # built from, with the same default queries FedLearnNet runs on their PRs.
 # Lives on dcsweden/build only, so it stays out of the upstream pull
 # request. Findings show under the repository's Security tab.
+#
+# It scans two branches: dcsweden/build (what we ship) and develop (the
+# mirror of upstream, the repository's default branch, which the Security
+# tab shows by default). A workflow only runs from the branch it lives on,
+# so develop is checked out here and its results are uploaded under its
+# own ref. CodeQL's default setup must stay off: GitHub rejects results
+# from an advanced workflow while default setup is enabled.
 
 on:
   push:
@@ -11,7 +18,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: dcsweden-codeql-${{ github.ref }}
+  group: dcsweden-codeql
   cancel-in-progress: true
 
 permissions:
@@ -22,8 +29,18 @@ jobs:
   analyze:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ["dcsweden/build", "develop"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+
+      - name: Record the scanned commit
+        id: head
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-java@v4
         with:
@@ -55,3 +72,5 @@ jobs:
       - uses: github/codeql-action/analyze@v3
         with:
           category: /language:java-kotlin
+          ref: refs/heads/${{ matrix.branch }}
+          sha: ${{ steps.head.outputs.sha }}
