@@ -9,6 +9,7 @@ import io.quarkus.logging.Log;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.StreamingOutput;
 import org.jboss.resteasy.reactive.multipart.FileUpload;
 
@@ -98,12 +99,14 @@ public class VolumeServiceImpl implements VolumeService {
             );
             return Response
                     .ok()
+                    .type(MediaType.TEXT_PLAIN_TYPE)
                     .entity("File successfully uploaded into volume '" + name + "'.")
                     .build();
 
         } catch (Exception e) {
             return Response
                     .status(Response.Status.BAD_REQUEST)
+                    .type(MediaType.TEXT_PLAIN_TYPE)
                     .entity("Upload failed: " + e.getMessage())
                     .build();
         }
